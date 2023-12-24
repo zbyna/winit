@@ -17,10 +17,12 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+#[derive(Debug)]
 pub struct Window {
     inner: Dispatcher<Inner>,
 }
 
+#[derive(Debug)]
 pub struct Inner {
     id: WindowId,
     pub window: web_sys::Window,
@@ -461,7 +463,7 @@ impl From<u64> for WindowId {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PlatformSpecificWindowBuilderAttributes {
     pub(crate) canvas: SendSyncWrapper<Option<backend::RawCanvasType>>,
     pub(crate) prevent_default: bool,

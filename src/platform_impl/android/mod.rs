@@ -3,6 +3,7 @@
 use std::{
     cell::Cell,
     collections::VecDeque,
+    fmt,
     hash::Hash,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -75,7 +76,7 @@ impl<T> PeekableReceiver<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SharedFlagSetter {
     flag: Arc<AtomicBool>,
 }
@@ -115,6 +116,15 @@ impl SharedFlag {
 pub struct RedrawRequester {
     flag: SharedFlagSetter,
     waker: AndroidAppWaker,
+}
+
+// TODO: Derive this once `AndroidAppWaker` implements Debug
+impl fmt::Debug for RedrawRequester {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedrawRequester")
+            .field("flag", &self.flag)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedrawRequester {
@@ -751,6 +761,7 @@ impl DeviceId {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes;
 
+#[derive(Debug)]
 pub(crate) struct Window {
     app: AndroidApp,
     redraw_requester: RedrawRequester,
@@ -1026,9 +1037,8 @@ impl Window {
 #[derive(Default, Clone, Debug)]
 pub struct OsError;
 
-use std::fmt::{self, Display, Formatter};
-impl Display for OsError {
-    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+impl fmt::Display for OsError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "Android OS Error")
     }
 }
