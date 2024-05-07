@@ -1,23 +1,23 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::mem;
 use std::rc::Weak;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use objc2::rc::Id;
 use objc2::runtime::AnyObject;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSSize};
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSCopying, NSObject, NSObjectProtocol, NSRunLoop,
+    NSRunLoopCommonModes,
+};
+use tracing::error;
 
 use super::event_handler::EventHandler;
 use super::event_loop::{stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
-use super::window::WinitWindow;
 use super::{menu, WindowId, DEVICE_ID};
-use crate::dpi::PhysicalSize;
-use crate::event::{DeviceEvent, Event, InnerSizeWriter, StartCause, WindowEvent};
+use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
 use crate::window::WindowId as RootWindowId;
 
@@ -50,7 +50,6 @@ pub(super) struct State {
     waker: RefCell<EventLoopWaker>,
     start_time: Cell<Option<Instant>>,
     wait_timeout: Cell<Option<Instant>>,
-    pending_events: RefCell<VecDeque<QueuedEvent>>,
     pending_redraw: RefCell<Vec<WindowId>>,
     // NOTE: This is strongly referenced by our `NSWindowDelegate` and our `NSView` subclass, and
     // as such should be careful to not add fields that, in turn, strongly reference those.
@@ -235,27 +234,23 @@ impl ApplicationDelegate {
     }
 
     pub fn queue_window_event(&self, window_id: WindowId, event: WindowEvent) {
-        self.ivars()
-            .pending_events
-            .borrow_mut()
-            .push_back(QueuedEvent::WindowEvent(window_id, event));
+        let mtm = MainThreadMarker::from(self);
+        let this = self.retain();
+        queue_event_handler(mtm, move || this.handle_window_event(window_id, event));
+    }
+
+    pub fn handle_window_event(&self, window_id: WindowId, event: WindowEvent) {
+        self.handle_event(Event::WindowEvent { window_id: RootWindowId(window_id), event });
     }
 
     pub fn queue_device_event(&self, event: DeviceEvent) {
-        self.ivars().pending_events.borrow_mut().push_back(QueuedEvent::DeviceEvent(event));
+        let mtm = MainThreadMarker::from(self);
+        let this = self.retain();
+        queue_event_handler(mtm, move || this.handle_device_event(event));
     }
 
-    pub fn queue_static_scale_factor_changed_event(
-        &self,
-        window: Id<WinitWindow>,
-        suggested_size: PhysicalSize<u32>,
-        scale_factor: f64,
-    ) {
-        self.ivars().pending_events.borrow_mut().push_back(QueuedEvent::ScaleFactorChanged {
-            window,
-            suggested_size,
-            scale_factor,
-        });
+    pub fn handle_device_event(&self, event: DeviceEvent) {
+        self.handle_event(Event::DeviceEvent { device_id: DEVICE_ID, event });
     }
 
     pub fn handle_redraw(&self, window_id: WindowId) {
@@ -347,47 +342,6 @@ impl ApplicationDelegate {
 
         self.handle_event(Event::UserEvent(HandlePendingUserEvents));
 
-        let events = mem::take(&mut *self.ivars().pending_events.borrow_mut());
-        for event in events {
-            match event {
-                QueuedEvent::WindowEvent(window_id, event) => {
-                    self.handle_event(Event::WindowEvent {
-                        window_id: RootWindowId(window_id),
-                        event,
-                    });
-                },
-                QueuedEvent::DeviceEvent(event) => {
-                    self.handle_event(Event::DeviceEvent { device_id: DEVICE_ID, event });
-                },
-                QueuedEvent::ScaleFactorChanged { window, suggested_size, scale_factor } => {
-                    let new_inner_size = Arc::new(Mutex::new(suggested_size));
-                    let scale_factor_changed_event = Event::WindowEvent {
-                        window_id: RootWindowId(window.id()),
-                        event: WindowEvent::ScaleFactorChanged {
-                            scale_factor,
-                            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(
-                                &new_inner_size,
-                            )),
-                        },
-                    };
-
-                    self.handle_event(scale_factor_changed_event);
-
-                    let physical_size = *new_inner_size.lock().unwrap();
-                    drop(new_inner_size);
-                    let logical_size = physical_size.to_logical(scale_factor);
-                    let size = NSSize::new(logical_size.width, logical_size.height);
-                    window.setContentSize(size);
-
-                    let resized_event = Event::WindowEvent {
-                        window_id: RootWindowId(window.id()),
-                        event: WindowEvent::Resized(physical_size),
-                    };
-                    self.handle_event(resized_event);
-                },
-            }
-        }
-
         let redraw = mem::take(&mut *self.ivars().pending_redraw.borrow_mut());
         for window_id in redraw {
             self.handle_event(Event::WindowEvent {
@@ -416,17 +370,6 @@ impl ApplicationDelegate {
         };
         self.ivars().waker.borrow_mut().start_at(min_timeout(wait_timeout, app_timeout));
     }
-}
-
-#[derive(Debug)]
-pub(crate) enum QueuedEvent {
-    WindowEvent(WindowId, WindowEvent),
-    DeviceEvent(DeviceEvent),
-    ScaleFactorChanged {
-        window: Id<WinitWindow>,
-        suggested_size: PhysicalSize<u32>,
-        scale_factor: f64,
-    },
 }
 
 #[derive(Debug)]
@@ -460,4 +403,63 @@ fn window_activation_hack(app: &NSApplication) {
             tracing::trace!("Skipping activating invisible window");
         }
     })
+}
+
+/// Submit a closure to run on the main thread as the next step in the run loop, before other
+/// event sources are processed.
+///
+/// This is used for running event handlers, as those are not allowed to run re-entrantly.
+///
+/// # Implementation
+///
+/// This queuing could be implemented in the following several ways with subtle differences in
+/// timing. This list is sorted in rough order in which they are run:
+///
+/// 1. Using `-[NSRunLoop performBlock:]` (uses `CFRunLoopPerformBlock`).
+///
+/// 2. Using `-[NSObject performSelectorOnMainThread:withObject:waitUntilDone:]` or wrapping the
+///    event in `NSEvent` and posting that to `-[NSApplication postEvent:atStart:]` (both creates a
+///    custom `CFRunLoopSource`, and signals that to wake up the main event loop).
+///
+///    a. `atStart = true`.
+///
+///    b. `atStart = false`.
+///
+/// 3. `dispatch_async` or `dispatch_async_f`. Note that this may appear before 2b, it does not
+///    respect the ordering that runloop events have.
+///
+/// We choose the first one, both for ease-of-implementation, but mostly for consistency, as we want
+/// the event to be queued in a way that preserves the order the events originally arrived in.
+///
+/// As an example, let's assume that we receive two events from the user, a mouse click which we
+/// handled by queuing it, and a window resize which we handled immediately. If we allowed AppKit to
+/// choose the ordering when queuing the mouse event, it might get put in the back of the queue, and
+/// the events would appear out of order to the user of Winit. So we must instead put the event at
+/// the very front of the queue, to be handled as soon as possible after handling whatever event's
+/// it's currently handling.
+pub fn queue_event_handler(mtm: MainThreadMarker, closure: impl FnOnce() + 'static) {
+    // We perform the block in all the common modes because we only queue this in response to an
+    // event, and as such we also want to queue it if the event is from one of the special modes.
+    //
+    // `NSRunLoopCommonModes`/`kCFRunLoopCommonModes` includes the following modes defined by Cocoa:
+    // - `NSDefaultRunLoopMode`/`kCFRunLoopDefaultMode`
+    // - `NSModalPanelRunLoopMode`
+    // - `NSEventTrackingRunLoopMode`
+    let modes = NSArray::from_id_slice(&[unsafe { NSRunLoopCommonModes.copy() }]);
+
+    // Convert `FnOnce()` to `Block<dyn Fn()>`.
+    let closure = Cell::new(Some(closure));
+    let block = block2::RcBlock::new(move || {
+        if let Some(closure) = closure.take() {
+            closure()
+        } else {
+            error!("tried to execute queued closure on main thread twice");
+        }
+    });
+
+    // SAFETY: We have a MainThreadMarker here, which means we know we're on the main thread, so
+    // scheduling (and scheduling a non-`Send` block) to that thread is allowed.
+    let _ = mtm;
+    let runloop = unsafe { NSRunLoop::mainRunLoop() };
+    unsafe { runloop.performInModes_block(&modes, &block) };
 }
