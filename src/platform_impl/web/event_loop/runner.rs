@@ -25,7 +25,7 @@ use web_time::{Duration, Instant};
 
 pub struct Shared(Rc<Execution>);
 
-pub(super) type EventHandler = dyn FnMut(Event<()>);
+pub(super) type EventHandler = dyn FnMut(Event);
 
 impl Clone for Shared {
     fn clone(&self) -> Self {
@@ -133,9 +133,9 @@ impl Shared {
         let document = window.document().expect("Failed to obtain document");
 
         Shared(Rc::<Execution>::new_cyclic(|weak| {
-            let proxy_spawner = WakerSpawner::new(main_thread, weak.clone(), |runner, count| {
+            let proxy_spawner = WakerSpawner::new(main_thread, weak.clone(), |runner, _count| {
                 if let Some(runner) = runner.upgrade() {
-                    Shared(runner).send_events(iter::repeat(Event::UserEvent(())).take(count))
+                    Shared(runner).send_event(Event::UserWakeUp);
                 }
             })
             .expect("`EventLoop` has to be created in the main thread");
@@ -605,7 +605,7 @@ impl Shared {
 
                 // Pre-fetch `UserEvent`s to avoid having to wait until the next event loop cycle.
                 events.extend(
-                    iter::repeat(Event::UserEvent(()))
+                    iter::repeat(Event::UserWakeUp)
                         .take(self.0.proxy_spawner.fetch())
                         .map(EventWrapper::from),
                 );
@@ -693,7 +693,7 @@ impl Shared {
         //     * The `register_redraw_request` closure.
         //     * The `destroy_fn` closure.
         if self.0.event_loop_recreation.get() {
-            crate::event_loop::EventLoopBuilder::<()>::allow_event_loop_recreation();
+            crate::event_loop::EventLoopBuilder::allow_event_loop_recreation();
         }
     }
 
@@ -765,12 +765,12 @@ impl Shared {
 }
 
 pub(crate) enum EventWrapper {
-    Event(Event<()>),
+    Event(Event),
     ScaleChange { canvas: Weak<RefCell<backend::Canvas>>, size: PhysicalSize<u32>, scale: f64 },
 }
 
-impl From<Event<()>> for EventWrapper {
-    fn from(value: Event<()>) -> Self {
+impl From<Event> for EventWrapper {
+    fn from(value: Event) -> Self {
         Self::Event(value)
     }
 }
