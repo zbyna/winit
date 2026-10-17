@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYUP, WM_KILLFOCUS, WM_SETFOCUS, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-use smol_str::SmolStr;
+use smol_str::{SmolStr, ToSmolStr};
 use tracing::{trace, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -244,11 +244,11 @@ impl KeyEventBuilder {
                         if !ctrl_on {
                             event_info.text = PartialText::System(event_info.utf16parts.clone());
                         } else {
-                            let mod_no_ctrl = mod_state.remove_only_ctrl();
                             let num_lock_on = kbd_state[VK_NUMLOCK as usize] & 1 != 0;
                             let vkey = event_info.vkey;
                             let physical_key = &event_info.physical_key;
-                            let key = layout.get_key(mod_no_ctrl, num_lock_on, vkey, physical_key);
+                            let key =  layout.get_key(mod_state, num_lock_on, vkey, physical_key);
+                            event_info.logical_key = PartialLogicalKey::This(key.clone());
                             event_info.text = PartialText::Text(key.to_text().map(SmolStr::new));
                         }
                         let ev = event_info.finalize();
